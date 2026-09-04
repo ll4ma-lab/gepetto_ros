@@ -1,0 +1,53 @@
+# Park the cell: the arm at its folded configuration, the hand at its rest posture.
+#
+# Served by `home_node`, which is a RESIDENT node -- it comes up with the cell and
+# stays up, and every trip home is a goal on this action rather than another run
+# of the process. That is the whole reason this interface exists: homing used to
+# mean launching the node, watching it move, and killing it again.
+#
+# THE TARGET IS NOT IN THE GOAL, deliberately. Home is a property of the cell, not
+# of the caller: the arm's folded configuration is `RobotProfile.arm_home` and the
+# hand's rest posture is the hand's own (see `home_node`'s docstring for why that
+# is the zero command on a tendon hand and `default_pose()` on a joint one). A
+# goal that could name its own target would be a one-waypoint `PlayPlan` wearing
+# this action's name, and the two would drift.
+#
+# MUTUALLY EXCLUSIVE WITH PLAYBACK. This action and `PlayPlan` publish to the same
+# servo and hand command topics, and nothing but the operator sequences them. A
+# goal is REJECTED while the cell-wide e-stop is engaged and while another home is
+# already running, and a running goal ABORTS the moment the stop is pressed.
+#
+# CANCELLING is always accepted: a cancel is how an operator stops a move that is
+# going somewhere they did not expect, and a stop request that can be refused is
+# not a stop request. The arm halts within one tick of the control loop.
+
+# --- Goal ---
+# Both channels are skipped by NEGATION so that a default-constructed goal --
+# `ros2 action send_goal ... "{}"` -- homes the whole cell, which is what someone
+# who typed no fields meant. A goal with both set is rejected rather than treated
+# as a no-op.
+bool skip_arm                       # leave the arm where it is
+bool skip_hand                      # leave the hand where it is
+float64 timeout                     # seconds; 0 means the node's own `timeout`
+                                    # parameter, which is the answer unless a
+                                    # caller has a reason of its own
+---
+# --- Result ---
+bool success                        # reached home inside the timeout
+string message                      # markdown, for the operator's status line --
+                                    # the same sentence the ~/go_home service
+                                    # returns, so the two cannot describe the
+                                    # same outcome differently
+float64 joint_error                 # rad, worst arm joint at the end
+float64 hand_error                  # worst driven actuator at the end, in
+                                    # hand_units
+string hand_units                   # "mm" or "rad" -- what hand_error is in,
+                                    # which follows the hand's command_kind
+float64 elapsed                     # wall seconds
+---
+# --- Feedback ---
+float64 joint_error                 # rad, worst arm joint right now
+float64 hand_error                  # in hand_units, as above
+float64 elapsed                     # wall seconds so far
+bool arm_at_home                    # inside `joint_tolerance`
+bool hand_at_home                   # inside `hand_tolerance`

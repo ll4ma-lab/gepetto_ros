@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>gepetto_ros_launch</name>
+  <version>0.0.0</version>
+  <description>Launch files that compose a gepetto cell: an LBR arm, a hand, the
+  executor and the viser workbench.</description>
+  <maintainer email="joe.liechty6@gmail.com">joe</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>gepetto_ros</exec_depend>
+  <exec_depend>gepetto_ros_interfaces</exec_depend>
+  <!-- The arm half: lbr_epfl.launch.py / lbr_allegro.launch.py are included
+       with their own hand-side nodes switched off. -->
+  <exec_depend>lbr_bringup</exec_depend>
+  <!-- The EPFL hand's bus node, which this launch starts itself because it
+       needs the conda env that lbr_bringup deliberately keeps away from MoveIt. -->
+  <exec_depend>epfl_hand_hardware</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

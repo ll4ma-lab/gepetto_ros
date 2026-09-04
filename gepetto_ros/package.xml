@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>gepetto_ros</name>
+  <version>0.0.0</version>
+  <description>The bridge between the gepetto_solvers planner and an LBR arm
+  with either the EPFL tendon hand or the Allegro Hand V5.</description>
+  <maintainer email="joe.liechty6@gmail.com">joe</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <!-- The hand state topics, and the arm's own joint_states. -->
+  <exec_depend>sensor_msgs</exec_depend>
+  <!-- The servo command topics: TwistStamped for the arm, JointJog for a
+       tendon hand's integrating jog node. -->
+  <exec_depend>control_msgs</exec_depend>
+  <!-- The table registration and the wrist pose readback. -->
+  <exec_depend>tf2_ros</exec_depend>
+  <depend>gepetto_ros_interfaces</depend>
+
+  <!-- gepetto_solvers is a pip package in the conda env the launch files inject,
+       NOT an ament package, so it is deliberately not declared here: colcon
+       would look for it in the workspace and fail. See the README. -->
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

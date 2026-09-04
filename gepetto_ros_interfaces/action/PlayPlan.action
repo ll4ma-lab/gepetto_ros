@@ -1,0 +1,72 @@
+# Execute a solve on the arm and the hand.
+#
+# The goal is a `gepetto_solvers.core.robot_plan.SolvePlan` flattened for the
+# wire -- exactly what `robot_plan.flatten_plan` produces, field for field, so
+# neither side of this action writes its own encoding. A plan is a path through
+# configuration space in the VISER world frame, with no timing. The executor
+# registers that frame against the bench using `corner_viz` and the workspace
+# table TF, times the path itself at the speed ceilings below, and plays it on a
+# free-running clock -- so the run's duration follows from the plan and the
+# ceilings alone, not from how well the arm tracked.
+#
+# ONE ACTION FOR EVERY HAND. A waypoint carries one vector of `dof_per_digit`
+# numbers per digit -- the DRIVEN actuators and nothing else -- and
+# `command_kind` says what they mean. The EPFL tendon hand drives one actuator
+# per digit and sends metres of tendon displacement; the Allegro drives four and
+# sends radians of joint position. Nothing between here and the hand driver
+# branches on which.
+#
+# There is no `start_waypoint`: resuming after an E-STOP is done by the client
+# slicing the waypoint list before it sends the goal, so the executor never has
+# to know that a run is a continuation of an earlier one.
+
+# --- Goal ---
+geometry_msgs/Pose[] wrist_poses    # one per waypoint, VISER world frame
+string[] digit_names                # solver digit names; the column-block order
+uint32 dof_per_digit                # driven actuators per digit: 1 tendon, 4 allegro
+string command_kind                 # "tendon_displacement_m" | "joint_position_rad"
+float64[] digit_cmd                 # row-major over (waypoint, digit, actuator);
+                                    # len == len(wrist_poses)*len(digit_names)*dof_per_digit.
+                                    # Tendon: metres from hand-open, + = pulled in
+                                    # = flexing. Joint: absolute radians.
+string[] notes                      # per waypoint, for the operator's status line
+float64[3] corner_viz               # viser table-square min corner, viser frame
+bool enable_arm
+bool enable_hand
+float64 max_linear                  # m/s ceiling, wrist
+float64 max_angular                 # rad/s ceiling, wrist
+float64 max_digit                   # ceiling on ONE driven actuator, per second,
+                                    # in command_kind's units (m/s or rad/s)
+---
+# --- Result ---
+bool success                        # ran to the end without aborting or stopping
+string verdict                      # markdown, for the status line; carries the
+                                    # worst tracking error seen along the path,
+                                    # which is the quality number for a run now
+                                    # that arrival is not waited on
+uint32 ticks
+float64 elapsed                     # wall seconds
+float64 final_position_error        # m, at the end of the terminal hold
+float64 final_rotation_error        # rad, at the end of the terminal hold
+bool resumable                      # stopped part-way; resume_waypoint is meaningful
+uint32 resume_waypoint              # index into THIS goal's wrist_poses
+float64 resume_path_time            # seconds along the plan's own clock
+---
+# --- Feedback ---
+uint32 tick
+float64 path_time                   # seconds along the plan's own clock
+float64 path_total                  # what path_time is counting toward
+uint32 waypoint
+uint32 num_waypoints
+string note                         # the waypoint's own note
+float64 position_error              # m, target vs. measured wrist
+float64 rotation_error              # rad
+float64 time_scale                  # always 1.0: the clock is free-running and
+                                    # the path never plays at anything but its
+                                    # commanded speed. Kept as a wire field
+                                    # rather than removed, which would force an
+                                    # interface rebuild on every consumer.
+bool settling                       # in the fixed terminal hold past the last
+                                    # waypoint. NOT a convergence wait: it runs
+                                    # for `terminal_hold` seconds and stops,
+                                    # whatever the error is doing.
