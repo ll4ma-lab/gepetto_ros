@@ -46,7 +46,7 @@ import numpy as np
 from rclpy.action import ActionClient
 from std_msgs.msg import Bool
 
-from gepetto_ros_interfaces.action import GraspClose, PlayPlan
+from gepetto_ros_interfaces.action import GraspClose, MoveHome, PlayPlan
 from gepetto_solvers.core import robot_plan
 from gepetto_solvers.core.solvers import pack_vectors
 
@@ -57,6 +57,7 @@ from .topics import (
     ESTOP_QOS,
     ESTOP_TOPIC,
     GRASP_CLOSE_ACTION,
+    MOVE_HOME_ACTION,
     PLAY_PLAN_ACTION,
 )
 from .wire import plan_to_goal
@@ -137,10 +138,16 @@ class RobotBridge:
 
         self._client = ActionClient(node, PlayPlan, PLAY_PLAN_ACTION)
         self._grasp_client = ActionClient(node, GraspClose, GRASP_CLOSE_ACTION)
-        #: ONE slot for both actions. They are mutually exclusive in the executor
-        #: -- each refuses a goal while the other runs -- so there can never be
-        #: two live handles, and one slot means the e-stop's cancel path does not
-        #: have to know which kind of run it is interrupting.
+        # Served by `home_node`, a DIFFERENT process from the executor above --
+        # resident, with its own control loop over the same servo and hand
+        # publishers. Which is exactly why it shares the goal slot below: the two
+        # processes drive one robot and must never overlap.
+        self._home_client = ActionClient(node, MoveHome, MOVE_HOME_ACTION)
+        #: ONE slot for all three actions. They are mutually exclusive on the
+        #: hardware -- the executor refuses a play while a close runs and vice
+        #: versa, and `home_node` refuses a home while the cell is stopped -- so
+        #: there can never be two live handles, and one slot means the e-stop's
+        #: cancel path does not have to know which kind of run it is interrupting.
         self._goal_handle = None
         self._goal_lock = threading.Lock()
         self._resume = None
@@ -284,6 +291,13 @@ class RobotBridge:
                 parts.append("tactile ok")
             if not self._grasp_client.server_is_ready():
                 parts.append(f"**no grasp server on {GRASP_CLOSE_ACTION}**")
+        # Resident, so its absence is a bring-up fault rather than a state --
+        # and *Go home* is the one button on the panel that needs it.
+        if not self._home_client.server_is_ready():
+            parts.append(f"**no home server on {MOVE_HOME_ACTION}** "
+                         f"(`ros2 run gepetto_ros home_node "
+                         f"--ros-args -p hand:={self._profile.name} "
+                         f"-p on_start:=false`)")
         if self._resume is not None:
             parts.append(f"paused at waypoint {self._resume.waypoint}")
         if self._estop.is_set():
@@ -448,6 +462,86 @@ class RobotBridge:
         if age is None:
             return False, f"nothing has arrived on `{self._tactile.topic}`"
         return True, ""
+
+    # --------------------------------------------------------------- go home
+
+    def move_home(self, skip_arm=False, skip_hand=False, timeout=0.0,
+                  on_progress=None, should_stop=None):
+        """Park the cell: the arm folded, the hand at its rest posture.
+
+        NOT a one-waypoint :meth:`play`, and the difference is the point. Home is
+        a property of the CELL rather than of the caller -- the arm's folded
+        configuration is ``RobotProfile.arm_home`` and the hand's rest is the
+        hand's own -- so the target is deliberately absent from the goal, and the
+        arm is driven in JOINT space, where the move is reachable by construction
+        and cannot stall in a singularity or come back on a different elbow.
+        Served by ``home_node``, which is resident: it comes up with the cell and
+        every trip home is a goal on it.
+
+        ``timeout`` of 0 means the node's own ``timeout`` parameter, which is the
+        answer unless the caller has a reason of its own. Blocks until the run
+        finishes -- the same contract :meth:`play` and :meth:`grasp_close` have,
+        so the visualizer's worker thread behaves identically for all three.
+
+        Returns the outcome as markdown.
+        """
+        if self._estop.is_set():
+            raise RuntimeError(f"E-STOP engaged: {self._estop_reason}")
+        if not self._home_client.wait_for_server(timeout_sec=2.0):
+            raise RuntimeError(
+                f"no home server on {MOVE_HOME_ACTION}. `home_node` is resident "
+                f"-- it is meant to be up with the cell -- so this is a cell "
+                f"brought up without it, or a `gepetto_ros` too old to have it. "
+                f"Start one with `ros2 run gepetto_ros home_node --ros-args "
+                f"-p hand:={self._profile.name} -p on_start:=false`.")
+
+        goal = MoveHome.Goal()
+        goal.skip_arm = bool(skip_arm)
+        goal.skip_hand = bool(skip_hand)
+        goal.timeout = float(timeout)
+
+        def on_feedback(message):
+            if on_progress is None:
+                return
+            on_progress(self._format_home_feedback(message.feedback))
+
+        send_future = self._home_client.send_goal_async(
+            goal, feedback_callback=on_feedback)
+        handle = self._wait(send_future, "sending the home goal")
+        if handle is None or not handle.accepted:
+            raise RuntimeError(
+                "`home_node` refused the goal -- it is already going home, the "
+                "e-stop is engaged, or the goal skipped both channels. Check "
+                "its log; it says which.")
+
+        with self._goal_lock:
+            self._goal_handle = handle
+        try:
+            if should_stop is not None and should_stop():
+                handle.cancel_goal_async()
+            result = self._wait(handle.get_result_async(), "the home result",
+                                timeout=self._result_timeout)
+        finally:
+            with self._goal_lock:
+                self._goal_handle = None
+
+        if result is None:
+            raise RuntimeError("`home_node` never returned a result")
+        self._last_note = result.result.message
+        return result.result.message
+
+    def _format_home_feedback(self, feedback):
+        # `hand_error` arrives ALREADY in the hand's display units -- home_node
+        # scales it before publishing -- so this reads the suffix off the hand
+        # and must not scale it a second time.
+        suffix, _scale = robot_plan.COMMAND_UNITS[
+            robot_plan.command_kind(self._hand)]
+        marks = ("arm " + ("at home" if feedback.arm_at_home else "moving"),
+                 "hand " + ("at home" if feedback.hand_at_home else "moving"))
+        return (f"**going home** &nbsp; {feedback.elapsed:.1f}s"
+                f"  \n`arm ` {feedback.joint_error * 1e3:6.1f} mrad &nbsp; "
+                f"`hand` {feedback.hand_error:6.2f} {suffix}"
+                f"  \n_{' &nbsp; '.join(marks)}_")
 
     @staticmethod
     def _format_grasp_feedback(names, feedback):

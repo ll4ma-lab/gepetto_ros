@@ -157,8 +157,9 @@ Brings up the arm on mock `ros2_control` + MoveIt Servo + RViz (from
 the viser workbench on <http://localhost:8080>.
 
 In the browser: solve, tick **move the real robot** (which arms *one* press and
-clears itself afterwards), then **Play solve on robot**. **Get robot state** reads
-the wrist pose from TF and the hand's measured state back onto the controls.
+clears itself afterwards), then **Play solve on robot**. **Go home** parks the
+cell instead — see [Going home](#going-home). **Get robot state** reads the wrist
+pose from TF and the hand's measured state back onto the controls.
 
 ### The real cell
 
@@ -252,7 +253,16 @@ hand and the no-contact timeout.
 ### Going home
 
 `home_node` is started by the bringup and stays up, so this is a request to the
-running cell rather than another process to launch and kill:
+running cell rather than another process to launch and kill.
+
+From the browser: tick **move the real robot** and press **Go home** in the ROS
+Interface panel. It sends the goal below with both channels and a 120 s budget,
+and greys out with the rest of the panel while anything else is running — the
+same arming and the same gate as *Play solve on robot*. Nothing on screen decides
+where it goes, so the picture is stale afterwards; *Get robot state* reconciles
+it.
+
+From a terminal:
 
 ```bash
 # the whole cell, with feedback and a cancel you can press
