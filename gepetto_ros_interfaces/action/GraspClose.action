@@ -1,0 +1,69 @@
+# Close the hand onto an object until measured contact, then hold.
+#
+# WHY THIS IS NOT A PlayPlan. A plan is a path that was decided in advance; this
+# is not one. The planner is purely kinematic -- no dynamics, no friction cone,
+# no force magnitudes, and the ellipsoid grasp alignment constraint credits every
+# contact with exactly one UNIT of virtual force -- so where a fingertip has to
+# end up to press with a given force is not something a solve can say. It depends
+# on where the object actually is and how it actually gives. So the solve
+# supplies DIRECTIONS and the robot supplies the stopping condition, and the
+# trajectory is discovered a tick at a time against the fingertip tactile
+# sensors.
+#
+# DIRECTIONS ARE IN THE WRIST FRAME, and that is load-bearing rather than a
+# convenience. The arm holds still through a close, so the palm frame is fixed;
+# expressing the normals in it means this action needs no TF lookup, no
+# viser-to-base registration and no staleness handling, and none of that class of
+# error can reach the fingers. The client rotates the solve's world-frame `-n_i`
+# into the wrist frame once, before it sends.
+#
+# EVERY THRESHOLD IS IN RAW TACTILE COUNTS. There is no calibration from this
+# sensor to newtons anywhere in this stack, so "force" here means "what the
+# fingertip reads", and the numbers are only comparable against readings from the
+# same finger. `force_targets` is measured ABOVE each digit's own resting value,
+# which the executor captures before anything moves; `abort_counts` is not,
+# because what a fingertip can take includes its resting offset.
+#
+# A RELEASE CARRIES NO TARGET, following MoveHome: the posture to back out to is
+# the one the last close started from, which is a property of the cell and is
+# remembered by the executor. A release with no close behind it is refused rather
+# than guessed at.
+
+# --- Goal ---
+string[] digit_names        # solver digit names to close; the row order below
+float64[] directions        # row-major (digit, 3), unit, WRIST frame.
+                            # len == 3 * len(digit_names).
+float64[] force_targets     # per digit, counts ABOVE that digit's resting value
+float64 speed               # m/s of fingertip travel along its direction
+float64 max_travel          # m; past this with no contact the digit gives up
+float64 abort_counts        # raw ceiling; a digit at or past it stops at once
+bool release                # ignore everything above and back out to the
+                            # posture the last close started from
+---
+# --- Result ---
+bool success                # every digit finished on contact (or released)
+string verdict              # markdown, for the operator's status line
+string[] digit_names        # what the arrays below are indexed by. Echoed rather
+                            # than assumed equal to the goal's, because a RELEASE
+                            # names none -- the executor supplies the digits from
+                            # the close it remembers -- and a caller labelling
+                            # those columns with its own guess would mislabel them.
+string[] stop_reasons       # per digit, in digit_names order: contact,
+                            # over-force, sensor out of range, no contact,
+                            # joint limit, released
+string[] stop_notes         # per digit, the detail behind the reason
+float64[] travel            # per digit, metres of fingertip travel achieved
+float64[] contact_counts    # per digit, final reading above rest
+float64[] peak_counts       # per digit, the largest reading seen. Worth its own
+                            # field: a digit that stopped on a collapsed sensor
+                            # ends with a LOW reading and a high peak, and the
+                            # two together are what say so.
+float64[] q_final           # row-major (digit, 4), radians
+float64 elapsed             # wall seconds
+---
+# --- Feedback ---
+float64[] travel            # per digit, metres so far
+float64[] contact_counts    # per digit, reading above rest
+uint32 digits_stopped
+uint32 num_digits
+string note

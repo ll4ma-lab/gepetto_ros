@@ -34,6 +34,7 @@ built for the tendon hand and is refused rather than broadcast to all four.
 
 import numpy as np
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Int32MultiArray
 
 from .base import clamp_target
 
@@ -43,6 +44,31 @@ DEFAULT_COMMAND_TOPIC = "/allegroHand/joint_cmd"
 #: the fingers from one topic. That remapped name is what to subscribe to in the
 #: assembled cell; the driver's own name still works when the hand runs alone.
 DEFAULT_STATE_TOPIC = "/lbr/joint_states"
+
+#: Wonik's own fingertip tactile topic, four `int32` on
+#: `std_msgs/Int32MultiArray` -- see `allegro_node.cpp::publishData`. NOT remapped
+#: by `lbr_allegro.launch.py`, unlike the joint states, so this is the name in the
+#: assembled cell as well as on a hand running alone.
+DEFAULT_TACTILE_TOPIC = "/allegroHand/tactile_sensors"
+
+#: Which element of that array is which solver digit.
+#:
+#: Verified on the hardware, and consistent with the driver's own code: the CAN
+#: decode writes index pairs (0, 1) and (2, 3) from `ID_CMD_FINGERTIP_1` and
+#: `_3`, and `allegro_node.cpp`'s grasp heuristic sums elements 0, 1 and 3 --
+#: index, middle and thumb, the tripod. It is written out rather than derived
+#: from `DIGIT_NAMES` because it is a fact about the FIRMWARE's ordering that
+#: happens to agree with ours, and a hand whose firmware disagreed would need
+#: this line changed and nothing else.
+DEFAULT_TACTILE_ORDER = ["index", "middle", "ring", "thumb"]
+
+#: What the driver reports for a fingertip whose reading fell outside
+#: `[0, 5000]`: ZERO. See `AllegroHandDrv.cpp`, which clamps out-of-range to zero
+#: and only THEN low-passes it. Consumers must not read a low number here as
+#: "this fingertip is touching nothing" -- it is equally "this fingertip is being
+#: crushed" -- which is why `core.solvers.grasp_servo` watches for a reading that
+#: collapses from its own peak rather than for one that is simply high.
+TACTILE_OUT_OF_RANGE = 0
 
 
 class AllegroJointDriver:
@@ -109,6 +135,44 @@ class AllegroJointDriver:
             if all(joint in seen for joint in joints):
                 out[digit] = np.array([seen[joint] for joint in joints])
         return out
+
+    # -- tactile ------------------------------------------------------------
+    #
+    # DECLARING THESE IS WHAT MAKES A HAND CLOSEABLE. `TactileReader` asks the
+    # driver class for them and the grasp action refuses outright on a driver
+    # that has neither, rather than degrading into a close with no stopping
+    # condition. The tendon hand's driver declares neither, and so cannot be
+    # asked to do a tactile close -- which is correct, it has no such sensor.
+
+    #: The message type, so the reader can subscribe without knowing the hand.
+    tactile_msg = Int32MultiArray
+
+    @staticmethod
+    def tactile_topic():
+        return DEFAULT_TACTILE_TOPIC
+
+    @classmethod
+    def decode_tactile(cls, hand, msg, order=None):
+        """`tactile_sensors` -> ``{solver digit: counts}``.
+
+        POSITIONAL, like the command path and unlike the joint-state readback:
+        this topic carries one publisher's fixed-length array with no names in
+        it at all, so the order IS the contract. See `DEFAULT_TACTILE_ORDER`.
+
+        A message shorter than the order is dropped entirely rather than partly
+        decoded -- the same rule `decode_state` applies to a half-present digit,
+        and for a stronger reason here: a short array means the elements are not
+        where this thinks they are, so every value in it is suspect.
+        """
+        order = list(order or DEFAULT_TACTILE_ORDER)
+        data = list(msg.data)
+        if len(data) < len(order):
+            raise ValueError(
+                f"tactile message has {len(data)} entries, expected at least "
+                f"{len(order)} for {order}")
+        known = set(hand.digit_names)
+        return {name: float(data[i]) for i, name in enumerate(order)
+                if name in known}
 
     # -- commanding ---------------------------------------------------------
 

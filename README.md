@@ -65,6 +65,15 @@ not something a caller names, so the goal only says which channels to *skip* and
 how long to allow. Both channels are skipped by negation, so `"{}"` homes
 everything.
 
+`action/GraspClose.action` — close the hand onto an object against the fingertip
+tactile sensors. Unlike `PlayPlan` this carries no path, because there is none to
+carry: the planner is purely kinematic and cannot say how far a finger must travel
+to press with a given force, so the goal carries the *directions* the solve
+supplies (the h_grasp,E inward normals, **in the wrist frame**) plus per-digit
+targets in raw tactile counts, and the trajectory is discovered a tick at a time.
+A `release` goal carries no target at all, following `MoveHome`: it backs out to
+the posture the last close started from, which the executor remembers.
+
 ### `gepetto_ros`
 
 | module | what it is |
@@ -75,13 +84,15 @@ everything.
 | `arm_servo.py` | `ArmTwistServo` / `ArmJointServo` — the arm half, identical for both robots |
 | `hand_drivers/` | `base.py` (the interface), `tendon.py`, `allegro.py` — **the one place the robots genuinely differ** |
 | `hand_state.py` | one subscription, decoded by the hand's own driver class |
+| `tactile.py` | the same, for fingertip contact readings. A driver that declares no `tactile_topic()` has no such sensor and the close refuses. |
 | `wire.py` | `PlayPlan` goal ↔ `SolvePlan`. Thin: the encoding lives in `gepetto_solvers`, where it is testable without ROS. |
 | `trajectory_executor.py` | the control loop: a time-scaled path on a free-running clock |
-| `executor_node.py` | the only process that publishes motion commands during playback |
+| `grasp_servo.py` | the tactile close's loop. I/O and timing only — every stop condition lives in `gepetto_solvers.core.solvers.grasp_servo`, where it is tested with no robot. |
+| `executor_node.py` | the only process that publishes motion commands. Serves **both** `PlayPlan` and `GraspClose`, which is what makes them mutually exclusive without a cross-process lock. |
 | `viz_node.py` | the viser workbench, hosted in a node and handed a bridge |
 | `robot_bridge.py` | the duck-typed bridge `HandVizApp` talks to |
 | `home_node.py` | park the arm and rest the hand, through the servo topics. **Resident** — it comes up with the cell and serves `/gepetto/move_home`. |
-| `play_client.py`, `fake_cell.py` | bring-up tools, as console scripts |
+| `play_client.py`, `grasp_client.py`, `fake_cell.py` | bring-up tools, as console scripts |
 
 There is deliberately **no `test/` directory**. The logic worth testing — the plan,
 the units, the flat encoding, the Allegro's positional joint order — is pure numpy
@@ -175,6 +186,68 @@ ros2 run gepetto_ros play_client --hand allegro --speed 0.5 --clear-estop
 unambiguously in the ROS half. `--hand-only` / `--arm-only` split the channels for
 bring-up; the workbench never does, because a coordinated trajectory played half
 way is not an operating mode.
+
+### Closing on an object
+
+The Allegro closes by **feeling for the object**, not by playing a ramp — which is
+why it declares no `close_ramp`. The planner has no dynamics, so it supplies only
+the directions (`h_grasp,E`'s inward normals, the arrows the workbench already
+draws) and the robot supplies the stopping condition:
+
+```bash
+ros2 run gepetto_ros fake_cell   --hand allegro --tactile-contact-at 0.02
+ros2 run gepetto_ros executor_node --ros-args -p hand:=allegro
+ros2 run gepetto_ros grasp_client --force 300          # counts, not newtons
+ros2 run gepetto_ros grasp_client --release            # back to where it started
+```
+
+Each digit advances along its own normal and freezes where it stops, while the
+others carry on. It stops on the target reached, a **1500-count** ceiling, a
+fingertip whose sensor went out of range, a 50 mm travel budget, or a joint limit;
+the result says which, per digit. Served by `executor_node`, so it can never run
+alongside a playback or a home.
+
+**Every number is in raw tactile counts.** Nothing in this stack calibrates them
+to newtons — Wonik publishes four bare `int32` — so a target is a dial position,
+comparable only against readings from the same fingertip, and is measured *above*
+that fingertip's resting value, which the executor samples before anything moves.
+
+### Lifting with the object
+
+Once closed, **Lift straight up** raises the wrist by the slider's height while
+leaving the fingers exactly where the close left them.
+
+That is done by *not commanding the hand at all* -- the lift is an ordinary
+`PlayPlan` with `enable_hand=False`. The Allegro's driver holds whatever position
+it last received, so silence is what keeps the grip: the fingers keep the
+command-to-measured deflection that is actually holding the object. Sending them
+anything, **including their own measured positions**, gives that deflection away
+and the grip goes slack at the top of the lift. This is why the lift is a separate
+button from *Play solve on robot*, which always drives both channels because a
+solve is one coordinated trajectory.
+
+`enable_hand=False` now means it literally: the executor builds no hand driver for
+such a run, where before it built one, seeded it from the measured posture, and
+published that once on the way out.
+
+Straight up is +Z in the scene frame and that is exact rather than approximate --
+`workspace_table_description.xacro` joins the bench to the base with `rpy="0 0
+pi/2"`, a pure yaw, so the two frames share a vertical. The height is a
+displacement, not an altitude: press twice and it goes up twice.
+
+**A crushed fingertip reads ZERO, not maximum.** `AllegroHandDrv.cpp` clamps
+anything outside `[0, 5000]` to zero and only then filters it. The servo watches
+for a reading that collapses to half its own peak while still pressing in, which
+catches it during the filter's decay — but a fingertip that crosses the whole span
+between two CAN samples is pinned at zero the entire way and cannot be told from
+an empty hand. The travel budget is the backstop, and the `no contact` note names
+both possibilities rather than blaming the object.
+
+`fake_cell` models all of it: `--tactile-contact-at` puts a virtual object that
+many metres of fingertip travel away, `--tactile-gain` sets its stiffness, and
+raising the gain far enough drives the true reading past 5000 so the out-of-range
+path is exercisable with no hardware. Omit `--tactile-contact-at` for an empty
+hand and the no-contact timeout.
 
 ### Going home
 

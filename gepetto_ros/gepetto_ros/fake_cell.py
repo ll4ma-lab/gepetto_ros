@@ -39,6 +39,7 @@ from control_msgs.msg import JointJog
 from geometry_msgs.msg import TransformStamped, TwistStamped
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Int32MultiArray
 from tf2_ros import TransformBroadcaster
 
 from gepetto_solvers.core.hands import get_hand
@@ -125,16 +126,56 @@ class _FakeAllegroHand:
     wrong joints rather than failing.
     """
 
-    def __init__(self, node, hand, publish_hz=100.0, tau=0.1):
+    #: Counts per metre of commanded overshoot past the object. Scaled so the
+    #: default 300-count target lands a few millimetres in, which is about what a
+    #: fingertip deflects on a real one.
+    _COUNTS_PER_M = 4e4
+
+    #: The real driver's validity clamp, verbatim from `AllegroHandDrv.cpp`:
+    #: anything outside this reads as ZERO, and only then is filtered. Reproduced
+    #: rather than approximated, because "a crushed fingertip reports no contact"
+    #: is the single sharpest edge in the tactile close and a fake cell that
+    #: smoothed it over would let the bug it guards against through.
+    _SENSOR_VALID = (0, 5000)
+    _SENSOR_ALPHA = 0.25
+
+    def __init__(self, node, hand, publish_hz=100.0, tau=0.1,
+                 contact_at=None, tactile_gain=1.0):
         from gepetto_solvers.core.hands.allegro import spec
 
         self._order = list(spec.DRIVER_JOINT_ORDER)
+        self._digits = list(spec.DIGIT_NAMES)
         self._n = len(self._order)
         self._desired = np.zeros(self._n)
         self._current = np.zeros(self._n)
         self._tau = tau
         self._dt = 1.0 / publish_hz
         self._node = node
+
+        #: How far each fingertip may TRAVEL from where it started before it runs
+        #: into the virtual object, in metres; None for an empty hand.
+        #:
+        #: A DISTANCE, not a joint angle, and the first version got this wrong in
+        #: a way worth recording. Blocking joints at a fixed angle looks
+        #: equivalent and is not: the servo's step is minimum-norm, so it puts
+        #: essentially all the motion into whichever single joint has the best
+        #: lever arm -- j1 for a finger, j0 for the thumb -- and a threshold on
+        #: "the flexion joints" therefore models an object the thumb can never
+        #: touch. Fingertip distance is both what an operator means by "the
+        #: object is 30 mm away" and the one quantity every digit shares.
+        self._contact_at = contact_at
+        self._tactile_gain = tactile_gain
+        self._tactile = np.zeros(len(self._digits))
+        #: Where each fingertip is blocked, as the joint vector it had when it
+        #: first reached the object. The hand stays there while the COMMAND runs
+        #: on past it, and that gap is what makes the reading -- which is exactly
+        #: how a position-controlled hand generates force.
+        self._blocked = [None] * len(self._digits)
+        self._fk = hand.digit_fk() if contact_at is not None else None
+        self._tip0 = (None if self._fk is None else
+                      [self._fk.tip_position(name, np.zeros(4))
+                       for name in self._digits])
+
         node.create_subscription(JointState,
                                  allegro_driver.DEFAULT_COMMAND_TOPIC,
                                  self._on_cmd, 1)
@@ -143,6 +184,8 @@ class _FakeAllegroHand:
         # would subscribe to in the assembled cell.
         self._pub = node.create_publisher(
             JointState, allegro_driver.DEFAULT_STATE_TOPIC, 3)
+        self._tactile_pub = node.create_publisher(
+            Int32MultiArray, allegro_driver.DEFAULT_TACTILE_TOPIC, 3)
         node.create_timer(self._dt, self.step)
 
     def _on_cmd(self, msg):
@@ -156,12 +199,65 @@ class _FakeAllegroHand:
 
     def step(self):
         alpha = 1.0 if self._tau <= 0.0 else 1.0 - math.exp(-self._dt / self._tau)
-        self._current = self._current + alpha * (self._desired - self._current)
+        # Where the object lets the finger get to, which is not where it was
+        # told to go. `_desired` is untouched: the gap between the two IS the
+        # contact force, and collapsing them would make the fake hand a thing
+        # that can never be pressed against.
+        reachable, raw = self._contact()
+        self._current = self._current + alpha * (reachable - self._current)
+
         msg = JointState()
         msg.header.stamp = self._node.get_clock().now().to_msg()
         msg.name = list(self._order)
         msg.position = [float(v) for v in self._current]
         self._pub.publish(msg)
+        self._publish_tactile(raw)
+
+    def _contact(self):
+        """``(reachable joint vector, raw counts per digit)``.
+
+        The object is a sphere of travel about each fingertip's starting point:
+        a finger may move ``contact_at`` metres and no further, and everything
+        the command asks for past that turns into a reading instead of motion.
+        """
+        reachable = self._desired.copy()
+        raw = np.zeros(len(self._digits))
+        if self._contact_at is None:
+            return reachable, raw
+
+        for d, name in enumerate(self._digits):
+            block = slice(4 * d, 4 * d + 4)
+            want = self._desired[block]
+            travel = float(np.linalg.norm(
+                self._fk.tip_position(name, want) - self._tip0[d]))
+            if travel <= self._contact_at:
+                self._blocked[d] = None
+                continue
+            if self._blocked[d] is None:
+                # First tick past the surface: the finger stops HERE. Held from
+                # now on, so the reading grows with the command rather than with
+                # a posture that is no longer changing.
+                self._blocked[d] = self._current[block].copy()
+            reachable[block] = self._blocked[d]
+            raw[d] = (self._tactile_gain * self._COUNTS_PER_M
+                      * (travel - self._contact_at))
+        return reachable, raw
+
+    def _publish_tactile(self, raw):
+        lo, hi = self._SENSOR_VALID
+        for i, value in enumerate(raw):
+            # THE DRIVER'S OWN ORDER OF OPERATIONS: clamp to zero first, filter
+            # second. Out of range therefore DECAYS toward "no contact" over
+            # about a dozen samples rather than pinning high, which is the
+            # behaviour `core.solvers.grasp_servo`'s collapse detector exists for
+            # and the only way to exercise it without a real fingertip.
+            value = 0.0 if (value < lo or value > hi) else value
+            self._tactile[i] = (self._SENSOR_ALPHA * value
+                                + (1.0 - self._SENSOR_ALPHA) * self._tactile[i])
+
+        out = Int32MultiArray()
+        out.data = [int(v) for v in self._tactile]
+        self._tactile_pub.publish(out)
 
 
 HANDS = {"epfl": _FakeTendonHand, "allegro": _FakeAllegroHand}
@@ -169,8 +265,10 @@ HANDS = {"epfl": _FakeTendonHand, "allegro": _FakeAllegroHand}
 
 class FakeCell(Node):
 
-    def __init__(self, profile, hand, tau, freeze_at, gain=1.0):
+    def __init__(self, profile, hand, tau, freeze_at, gain=1.0,
+                 hand_kwargs=None):
         super().__init__("fake_cell")
+        self._hand_kwargs = dict(hand_kwargs or {})
         self._profile = profile
         self._tau = tau
         self._gain = gain
@@ -190,7 +288,15 @@ class FakeCell(Node):
         self.create_subscription(TwistStamped,
                                  "/lbr/servo_node/delta_twist_cmds",
                                  self._on_twist, 10)
-        self._hand = HANDS[profile.name](self, hand)
+        # Only the Allegro models a fingertip sensor, so only it takes the
+        # tactile knobs. Passed by keyword and filtered by the hand's own
+        # signature rather than branched on here, so a second sensing hand
+        # needs no edit at this line.
+        import inspect
+        accepted = inspect.signature(HANDS[profile.name]).parameters
+        self._hand = HANDS[profile.name](
+            self, hand,
+            **{k: v for k, v in self._hand_kwargs.items() if k in accepted})
         self._tf = TransformBroadcaster(self)
 
         self._dt = 1.0 / 200.0
@@ -274,13 +380,32 @@ def main(argv=None):
                         help="servo pipeline lag, seconds")
     parser.add_argument("--freeze-at", type=float, default=0.0,
                         help="pin the arm after N seconds (stall test)")
+    parser.add_argument("--tactile-contact-at", type=float, default=None,
+                        metavar="METRES",
+                        help="Allegro only. How far each fingertip may travel "
+                             "before it runs into the virtual object: past it "
+                             "the finger stops while the command keeps "
+                             "advancing, which is how a position-controlled "
+                             "hand makes force. Omit for an EMPTY hand, which "
+                             "is the no-contact timeout test; 0.02 is an object "
+                             "well within reach of a 50 mm budget.")
+    parser.add_argument("--tactile-gain", type=float, default=1.0,
+                        help="Stiffness multiplier. 1.0 puts a 300-count "
+                             "reading a few millimetres into the object. Raise "
+                             "it to trip the over-force abort sooner; raise it "
+                             "far enough that the TRUE reading passes 5000 and "
+                             "the sensor goes out of range, which this cell "
+                             "reproduces faithfully -- the driver reports zero "
+                             "for that, not a maximum.")
     args, ros_args = parser.parse_known_args(argv)
 
     profile = get_profile(args.hand)
     hand = get_hand(profile.solver_hand)
 
     rclpy.init(args=ros_args)
-    node = FakeCell(profile, hand, args.tau, args.freeze_at, args.gain)
+    node = FakeCell(profile, hand, args.tau, args.freeze_at, args.gain,
+                    hand_kwargs=dict(contact_at=args.tactile_contact_at,
+                                     tactile_gain=args.tactile_gain))
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

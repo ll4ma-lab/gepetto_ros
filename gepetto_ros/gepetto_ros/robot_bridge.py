@@ -46,12 +46,19 @@ import numpy as np
 from rclpy.action import ActionClient
 from std_msgs.msg import Bool
 
-from gepetto_ros_interfaces.action import PlayPlan
+from gepetto_ros_interfaces.action import GraspClose, PlayPlan
 from gepetto_solvers.core import robot_plan
+from gepetto_solvers.core.solvers import pack_vectors
 
 from .frames import FrameLookup, matrix_to_pose
 from .hand_state import HandStateReader
-from .topics import ESTOP_QOS, ESTOP_TOPIC, PLAY_PLAN_ACTION
+from .tactile import TactileReader
+from .topics import (
+    ESTOP_QOS,
+    ESTOP_TOPIC,
+    GRASP_CLOSE_ACTION,
+    PLAY_PLAN_ACTION,
+)
 from .wire import plan_to_goal
 
 __all__ = ["ESTOP_QOS", "ESTOP_TOPIC", "RobotState", "RobotBridge"]
@@ -121,7 +128,19 @@ class RobotBridge:
         self._estop_pub = node.create_publisher(Bool, ESTOP_TOPIC, ESTOP_QOS)
         node.create_subscription(Bool, ESTOP_TOPIC, self._on_estop_msg, ESTOP_QOS)
 
+        # Read for the status line only. The close itself is run entirely in the
+        # executor's process -- this side never sees a tactile count while one is
+        # in flight, it sees the feedback the action sends back -- but "is the
+        # sensor even publishing" has to be answerable BEFORE the operator arms
+        # anything, and the Robot folder is where they would look.
+        self._tactile = TactileReader(node, hand, profile.hand_driver)
+
         self._client = ActionClient(node, PlayPlan, PLAY_PLAN_ACTION)
+        self._grasp_client = ActionClient(node, GraspClose, GRASP_CLOSE_ACTION)
+        #: ONE slot for both actions. They are mutually exclusive in the executor
+        #: -- each refuses a goal while the other runs -- so there can never be
+        #: two live handles, and one slot means the e-stop's cancel path does not
+        #: have to know which kind of run it is interrupting.
         self._goal_handle = None
         self._goal_lock = threading.Lock()
         self._resume = None
@@ -252,6 +271,19 @@ class RobotBridge:
             parts.append(f"**no executor on {PLAY_PLAN_ACTION}** "
                          f"(`ros2 run gepetto_ros executor_node "
                          f"--ros-args -p hand:={self._profile.name}`)")
+        # Only on a hand that HAS fingertips. A line saying "no tactile" about
+        # the tendon hand would be reporting the absence of a sensor it was never
+        # built with, which reads as a fault rather than as a fact.
+        if self._tactile.available:
+            _counts, tactile_age = self._tactile.read()
+            if tactile_age is None:
+                parts.append(f"**no tactile** on `{self._tactile.topic}`")
+            elif tactile_age > 1.0:
+                parts.append(f"**tactile {tactile_age:.1f}s old**")
+            else:
+                parts.append("tactile ok")
+            if not self._grasp_client.server_is_ready():
+                parts.append(f"**no grasp server on {GRASP_CLOSE_ACTION}**")
         if self._resume is not None:
             parts.append(f"paused at waypoint {self._resume.waypoint}")
         if self._estop.is_set():
@@ -332,6 +364,106 @@ class RobotBridge:
         if result is None:
             raise RuntimeError("the executor never returned a result")
         return self._absorb(signature, offset, result.result, resume_note)
+
+    # ------------------------------------------------------------ grasp close
+
+    def grasp_close(self, digit_names, directions, targets, speed, max_travel,
+                    abort_counts, release=False, on_progress=None,
+                    should_stop=None):
+        """Close the named digits onto the object, or back out of a close.
+
+        ``directions`` is ``{digit: (3,)}`` and must already be in the WRIST
+        frame -- see the action file on why the rotation happens on the client.
+        ``targets`` is ``{digit: counts above rest}``. Blocks until the run
+        finishes, the same contract :meth:`play` has, so the visualizer's worker
+        thread behaves identically for both.
+
+        Returns the verdict as markdown.
+        """
+        if self._estop.is_set():
+            raise RuntimeError(f"E-STOP engaged: {self._estop_reason}")
+        if not self._grasp_client.wait_for_server(timeout_sec=2.0):
+            raise RuntimeError(
+                f"no grasp server on {GRASP_CLOSE_ACTION}. It is served by the "
+                f"same node as playback, so if that is up this is an executor "
+                f"too old to have it -- rebuild `gepetto_ros` and "
+                f"`gepetto_ros_interfaces`.")
+
+        names = list(digit_names)
+        goal = GraspClose.Goal()
+        goal.digit_names = names
+        goal.directions = ([] if release
+                           else pack_vectors(names, directions))
+        goal.force_targets = ([] if release
+                              else [float(targets[n]) for n in names])
+        goal.speed = float(speed)
+        goal.max_travel = float(max_travel)
+        goal.abort_counts = float(abort_counts)
+        goal.release = bool(release)
+
+        def on_feedback(message):
+            if on_progress is None:
+                return
+            on_progress(self._format_grasp_feedback(names, message.feedback))
+
+        send_future = self._grasp_client.send_goal_async(
+            goal, feedback_callback=on_feedback)
+        handle = self._wait(send_future, "sending the grasp goal")
+        if handle is None or not handle.accepted:
+            raise RuntimeError(
+                "the executor refused the close -- it is already playing or "
+                "closing, the e-stop is engaged, the fingertip sensor is not "
+                "publishing, or (for a release) no close has run yet. Check its "
+                "log; it says which.")
+
+        with self._goal_lock:
+            self._goal_handle = handle
+        try:
+            if should_stop is not None and should_stop():
+                handle.cancel_goal_async()
+            result = self._wait(handle.get_result_async(), "the grasp result",
+                                timeout=self._result_timeout)
+        finally:
+            with self._goal_lock:
+                self._goal_handle = None
+
+        if result is None:
+            raise RuntimeError("the executor never returned a grasp result")
+        self._last_note = result.result.verdict
+        return result.result.verdict
+
+    def grasp_available(self):
+        """``(available, why_not)`` -- whether a tactile close could run now.
+
+        Asked by the visualizer to decide whether to build the panel at all, so
+        it answers with a REASON rather than a bool: a greyed-out button that
+        cannot say why is worse than no button.
+        """
+        if not self._tactile.available:
+            return False, (f"the {self._hand.name} hand's driver declares no "
+                           f"fingertip sensor")
+        if not self._grasp_client.server_is_ready():
+            return False, f"no grasp server on `{GRASP_CLOSE_ACTION}`"
+        _counts, age = self._tactile.read()
+        if age is None:
+            return False, f"nothing has arrived on `{self._tactile.topic}`"
+        return True, ""
+
+    @staticmethod
+    def _format_grasp_feedback(names, feedback):
+        # Positional labels where a name is missing. A RELEASE goal names no
+        # digits -- the executor supplies them from the close it remembers -- so
+        # this side genuinely does not know them until the result comes back, and
+        # a numbered row is better than a blank block.
+        labels = [names[i] if i < len(names) else f"digit {i}"
+                  for i in range(len(feedback.travel))]
+        cells = "  \n".join(
+            f"`{label:<7}` {travel * 1e3:5.1f} mm &nbsp; {counts:.0f} counts"
+            for label, travel, counts in zip(labels, feedback.travel,
+                                             feedback.contact_counts))
+        return (f"**closing** &nbsp; {feedback.digits_stopped}"
+                f"/{feedback.num_digits} stopped &nbsp; _{feedback.note}_"
+                f"  \n{cells}")
 
     def _wait(self, future, what, timeout=30.0):
         """Block a worker thread on a future.

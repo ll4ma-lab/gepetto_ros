@@ -26,6 +26,7 @@ setup(
             # directory: they poke a LIVE system and are run the way every other
             # node is.
             'play_client = gepetto_ros.play_client:main',
+            'grasp_client = gepetto_ros.grasp_client:main',
             'fake_cell = gepetto_ros.fake_cell:main',
         ],
     },

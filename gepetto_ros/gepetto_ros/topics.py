@@ -38,3 +38,12 @@ PLAY_PLAN_ACTION = "/gepetto/play_plan"
 #: action, and the two are mutually exclusive -- two of these under different
 #: namespaces would be two things able to park one robot at once.
 MOVE_HOME_ACTION = "/gepetto/move_home"
+
+#: Where `executor_node` serves `gepetto_ros_interfaces/action/GraspClose`: the
+#: tactile close, which the planner cannot express because it has no dynamics.
+#:
+#: Served by the SAME node as `PLAY_PLAN_ACTION`, and that is the point. Both
+#: drive the hand's command topic, so they must never overlap, and one node
+#: holding both is the cheapest way to make that impossible -- a second process
+#: would need a lock the two of them could disagree about.
+GRASP_CLOSE_ACTION = "/gepetto/grasp_close"

@@ -760,9 +760,25 @@ class TrajectoryExecutor:
 
         # The driver for THIS robot, fresh for this run. Which class it is comes
         # from the profile and is the only per-robot choice the loop makes.
-        self._hand = self._profile.hand_driver(
-            self._node, self._hand_model, limits=self._travel, hz=limits.hz)
-        self._hand.seed(measured)
+        #
+        # ONLY WHEN THE HAND IS ENABLED, and that is not a micro-optimisation.
+        # `enable_hand=False` has to mean this node does not publish to the hand's
+        # command topic AT ALL, because the Allegro driver holds whatever position
+        # it last received -- so silence is what keeps a closed hand closed. Built
+        # unconditionally, the `finally` below would `halt()` it on the way out,
+        # and halt PUBLISHES: one message carrying the seeded MEASURED posture,
+        # which on a hand gripping something is precisely the posture at which it
+        # is touching the object with no force left. A lift performed with the
+        # fingers already closed would set the object down at the end of the run.
+        if enable_hand:
+            self._hand = self._profile.hand_driver(
+                self._node, self._hand_model, limits=self._travel, hz=limits.hz)
+            self._hand.seed(measured)
+        else:
+            # Cleared rather than left over: `halt()` may be called from the
+            # e-stop callback at any moment, and a stale driver from the previous
+            # run would publish that run's setpoint into this one.
+            self._hand = None
 
         self._log.info(
             f"playback: {len(plan.waypoints)} waypoints, {schedule.total:.1f} s "
@@ -787,7 +803,8 @@ class TrajectoryExecutor:
         finally:
             self._playing = False
             self._arm.halt()
-            self._hand.halt()
+            if self._hand is not None:
+                self._hand.halt()
 
         outcome.elapsed = time.monotonic() - started
         self._log.info(f"playback: {outcome.verdict}")
